@@ -9147,6 +9147,16 @@ int main(int argc, char** argv) {
                 bool continues = d.cached && starts_with(d.ids, {});
                 for (const ConvCheckpoint& c : d.checks) continues = continues || starts_with(c.ids, c.imgs);
                 if (d.cached && !d.active && !d.img && !d.partial && !continues) {
+                    {   // why it is not a continuation: where the prompt leaves the slot, and the slot's deepest point
+                        size_t common = 0;
+                        while (common < d.ids.size() && common < (size_t) n && (int64_t) d.ids[common] == (int64_t) ids[common])
+                            ++common;
+                        size_t deepest = 0;
+                        for (const ConvCheckpoint& c : d.checks) deepest = std::max(deepest, c.ids.size());
+                        std::fprintf(stderr, "strata batch: slot %d holds %zu tokens; this prompt (%lld) shares %zu of "
+                                     "them; the slot's deepest checkpoint is %zu (%zu kept)\n", admit_slot, d.ids.size(),
+                                     (long long) n, common, deepest, d.checks.size());
+                    }
                     // the slot's conversation would be overwritten by this admission: the main session's own
                     // conversation is parked first unless a slot keeps it, then the slot's moves into the main
                     // session and the outgoing park below keeps it
@@ -11048,12 +11058,20 @@ int main(int argc, char** argv) {
                     }
                     sl.cvec = cvec_cached;
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
-                    const ConvCheckpoint* best = nullptr;
+                    // the slot keeps the DEEPEST few of the chain, not one: the client re-renders the last reply
+                    // (without its thinking), so the next turn diverges somewhere inside it, and only a checkpoint
+                    // at or below that point resumes it (one checkpoint missed it often enough to re-read whole
+                    // conversations once parking became lazy)
+                    constexpr size_t kSlotChecks = 4;
+                    std::vector<const ConvCheckpoint*> keep;
                     for (const ConvCheckpoint& c : checks)
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
-                            best = &c;
-                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                        if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                            keep.push_back(&c);
+                    std::sort(keep.begin(), keep.end(),
+                              [](const ConvCheckpoint* x, const ConvCheckpoint* y) { return x->ids.size() > y->ids.size(); });
+                    if (keep.size() > kSlotChecks) keep.resize(kSlotChecks);
+                    if (!sl.img)
+                        for (auto it = keep.rbegin(); it != keep.rend(); ++it) sl.checks.push_back(**it);
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
                 }
