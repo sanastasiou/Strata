@@ -9599,12 +9599,15 @@ int main(int argc, char** argv) {
                     return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : int64_t(0);
                 }();
                 if (o.batch <= 0 || piped) return sp.run(ids.data() + a0, b0 - a0, a0, e);
-                const int64_t P = strata::program::prompt_read_piece(sp.chunk(), !stages.empty() && !batch_on(),
-                                                                     split_piece);
-                if (P == 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                // decided again at every boundary: a read that began beside a decoding slot goes back to whole
+                // pieces once no slot decodes (they finish their short turns within seconds of a long read)
+                const auto piece_now = [&] {
+                    return strata::program::prompt_read_piece(sp.chunk(), !stages.empty() && !batch_on(), split_piece);
+                };
+                if (piece_now() == 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
                 const int64_t C = std::max<int64_t>(sp.chunk(), 1);
                 for (int64_t q = a0; q < b0;) {
-                    const int64_t r = std::min(b0, q + P);
+                    const int64_t r = strata::program::prompt_read_run_end(q, b0, piece_now());
                     const auto tq = Clock::now();
                     if (!sp.run(ids.data() + q, r - q, q, e)) return false;
                     q = r;

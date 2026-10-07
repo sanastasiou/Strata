@@ -27,6 +27,20 @@ int main() {
     ok &= check(8192, true, 100, 8192);
     ok &= check(32768, true, 65536, 65536);
     ok &= check(0, true, 3, 3);
+    // a run ends one piece on, at the end of the read, or (piece 0: no slot decoding, no piece set) at the end
+    auto end_is = [&](int64_t q, int64_t end, int64_t piece, int64_t expected) {
+        ++checks;
+        const int64_t got = strata::program::prompt_read_run_end(q, end, piece);
+        if (got != expected)
+            std::printf("FAIL prompt_read_run_end(%lld, %lld, %lld) = %lld, expected %lld\n", (long long) q,
+                        (long long) end, (long long) piece, (long long) got, (long long) expected);
+        return got == expected;
+    };
+    ok &= end_is(0, 249251, 8192, 8192);
+    ok &= end_is(245760, 249251, 8192, 249251);
+    ok &= end_is(8192, 249251, 65536, 73728);
+    ok &= end_is(8192, 249251, 0, 249251);
+    ok &= end_is(8192, 249251, -1, 249251);
     if (!ok) return 1;
     std::printf("read_piece_test OK (%d checks)\n", checks);
 }
