@@ -12429,6 +12429,62 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            // Lazy parking (--batch): the conversation the main session holds is usually held by an idle slot too
+            // (admission copies it there), so parking it on every switch copied up to ~13 GB per request at 435K
+            // tokens for nothing, and the copies evicted each other.  A conversation is parked only when nothing
+            // else keeps it: when the main session is about to be overwritten and no idle slot holds it, or when
+            // the slot holding it is given to another conversation (moved into the main session first, below, so
+            // the park further down keeps it).  Off where slots lose their state otherwise (pipelined groups).
+            const bool lazy_park = o.batch > 0 && o.pipeline_windows == 0 && o.batch_groups <= 1 &&
+                                   conversations.enabled() && o.prompt_cache > 0;
+            auto held_by_idle_slot = [&](int except) -> bool {
+                if (!live_ok || live.empty() || !live_imgs.empty()) return false;
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    const BSlot& sl = bs[(size_t) b];
+                    if (b == except || sl.active || !sl.cached || sl.img || sl.partial || sl.cvec != cvec_cached ||
+                        sl.ids.size() < live.size())
+                        continue;
+                    if (std::equal(live.begin(), live.end(), sl.ids.begin())) return true;
+                }
+                return false;
+            };
+            if (lazy_park && admit_slot >= 0) {
+                BSlot& d = bs[(size_t) admit_slot];
+                bool continues = d.cached && starts_with(d.ids, {});
+                for (const ConvCheckpoint& c : d.checks) continues = continues || starts_with(c.ids, c.imgs);
+                if (d.cached && !d.active && !d.img && !d.partial && !continues) {
+                    // the slot's conversation would be overwritten by this admission: the main session's own
+                    // conversation is parked first unless a slot keeps it, then the slot's moves into the main
+                    // session and the outgoing park below keeps it
+                    const bool main_is_slots = live_ok && live.size() <= d.ids.size() &&
+                                               std::equal(live.begin(), live.end(), d.ids.begin());
+                    if (!main_is_slots && !held_by_idle_slot(admit_slot) && !park_current(0)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    const auto t0 = Clock::now();
+                    if (copy_from_slot(admit_slot, nullptr, err)) {
+                        live = d.ids;
+                        live_imgs.clear();
+                        checks = d.checks;
+                        cvec_cached = d.cvec;
+                        live_ok = true;
+                        std::fprintf(stderr, "strata batch: slot %d gives its conversation (%zu tokens) to the main "
+                                     "session to be parked before a new one takes the slot (%.1f ms)\n", admit_slot,
+                                     live.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    } else {
+                        std::fprintf(stderr, "strata batch: moving slot %d's conversation out failed (%s); it is "
+                                     "dropped\n", admit_slot, err.c_str());
+                        err.clear();
+                        live.clear();
+                        live_imgs.clear();
+                        checks.clear();
+                        live_ok = false;
+                    }
+                    d.cached = false;
+                    d.checks.clear();
+                }
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -12582,6 +12638,9 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+            // lazy parking: an idle slot keeps the outgoing conversation, or this request continues it
+            const bool kept_elsewhere = lazy_park && (held_by_idle_slot(admit_slot) ||
+                                                      (live_ok && starts_with(live, live_imgs)));
             // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
             // this conversation wrote last), so a conversation that advanced fewer than N tokens since then keeps it:
             // it still holds this conversation's prefix, and re-parking writes the whole snapshot only for the next
@@ -12591,7 +12650,7 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
-            if (borrow && !pin_sibling && park_worth) {
+            if (borrow && !pin_sibling && park_worth && !kept_elsewhere) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
                 const bool blocked = conversations.guard_blocked();
@@ -12614,7 +12673,7 @@ int main(int argc, char** argv) {
                     }
                 }
             } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
+                       !kept_elsewhere && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -13344,7 +13403,9 @@ int main(int argc, char** argv) {
                 auto give_way = [&](int ys, int64_t q, std::string& err) -> bool {
                     const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
                                      (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
-                                     b0 - q > std::max<int64_t>(C_read, o.short_read);
+                                     b0 - q > std::max<int64_t>(C_read, o.short_read) &&
+                                     // lazy parking: another conversation's slot holds its only copy
+                                     (!lazy_park || ys == admit_slot || !bs[(size_t) ys].cached);
                     std::string ye;
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
