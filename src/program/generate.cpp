@@ -9079,10 +9079,12 @@ int main(int argc, char** argv) {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
+                    bool took_partial = false;
                     if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
                         resumed_from0 = bs[(size_t) slot_source].partial_from0;
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
+                        took_partial = true;
                     }
                     if (slot_ck != nullptr) {
                         live = slot_ck->ids;
@@ -9090,6 +9092,15 @@ int main(int argc, char** argv) {
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                        // the slot's turn checkpoint comes along: this read starts past it, so it would save none, and
+                        // the next admission would hand the slot no point to resume the next turn from (the client
+                        // re-renders this reply without its thinking, so only that checkpoint matches it)
+                        if (!took_partial)
+                            for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks)
+                                if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
+                                    checks.push_back(c);
+                                    checks.back().used = ++check_clock;
+                                }
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
