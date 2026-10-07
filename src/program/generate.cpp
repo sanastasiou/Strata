@@ -12455,6 +12455,16 @@ int main(int argc, char** argv) {
                 bool continues = d.cached && starts_with(d.ids, {});
                 for (const ConvCheckpoint& c : d.checks) continues = continues || starts_with(c.ids, c.imgs);
                 if (d.cached && !d.active && !d.img && !d.partial && !continues) {
+                    {   // why it is not a continuation: where the prompt leaves the slot, and the slot's deepest point
+                        size_t common = 0;
+                        while (common < d.ids.size() && common < (size_t) n && (int64_t) d.ids[common] == (int64_t) ids[common])
+                            ++common;
+                        size_t deepest = 0;
+                        for (const ConvCheckpoint& c : d.checks) deepest = std::max(deepest, c.ids.size());
+                        std::fprintf(stderr, "strata batch: slot %d holds %zu tokens; this prompt (%lld) shares %zu of "
+                                     "them; the slot's deepest checkpoint is %zu (%zu kept)\n", admit_slot, d.ids.size(),
+                                     (long long) n, common, deepest, d.checks.size());
+                    }
                     // the slot's conversation would be overwritten by this admission: the main session's own
                     // conversation is parked first unless a slot keeps it, then the slot's moves into the main
                     // session and the outgoing park below keeps it
@@ -15326,12 +15336,20 @@ int main(int argc, char** argv) {
                     sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
                     const ConvCheckpoint* best = nullptr;
                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
+                    // the slot keeps the DEEPEST few of the chain, not one: the client re-renders the last reply
+                    // (without its thinking), so the next turn diverges somewhere inside it, and only a checkpoint
+                    // at or below that point resumes it (one checkpoint missed it often enough to re-read whole
+                    // conversations once parking became lazy)
+                    constexpr size_t kSlotChecks = 4;
+                    std::vector<const ConvCheckpoint*> keep;
                     for (size_t i = 0; i < checks.size(); ++i) {
                         const ConvCheckpoint& c = checks[i];
-                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
-                            std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
-                            best = &c;
-                            best_at = i;
+                        if (c.ids.size() < live.size() && std::equal(c.ids.begin(), c.ids.end(), live.begin())) {
+                            keep.push_back(&c);
+                            if (best == nullptr || c.ids.size() > best->ids.size()) {
+                                best = &c;
+                                best_at = i;
+                            }
                         }
                     }
                     bool best_lent = false;
@@ -15353,12 +15371,27 @@ int main(int argc, char** argv) {
                         sl.checks.push_back(std::move(checks[best_at]));
                         checks.erase(checks.begin() + (std::ptrdiff_t) best_at);
                     } else if (best != nullptr && !sl.img) {
-                        if (ckpt_pool.on()) {   // a copy into a dropped checkpoint's vectors (their pages are in)
-                            ConvCheckpoint c = ckpt_pool.take();
-                            c = *best;
-                            sl.checks.push_back(std::move(c));
+                        if (best_lent) {   // STRATA_SLOT_CKPT_MOVE: the one mounted from another slot, as upstream
+                            if (ckpt_pool.on()) {
+                                ConvCheckpoint c = ckpt_pool.take();
+                                c = *best;
+                                sl.checks.push_back(std::move(c));
+                            } else {
+                                sl.checks.push_back(*best);
+                            }
                         } else {
-                            sl.checks.push_back(*best);
+                        std::sort(keep.begin(), keep.end(),
+                                  [](const ConvCheckpoint* x, const ConvCheckpoint* y) { return x->ids.size() > y->ids.size(); });
+                        if (keep.size() > kSlotChecks) keep.resize(kSlotChecks);
+                        for (auto it = keep.rbegin(); it != keep.rend(); ++it) {
+                            if (ckpt_pool.on()) {   // a copy into a dropped checkpoint's vectors (their pages are in)
+                                ConvCheckpoint c = ckpt_pool.take();
+                                c = **it;
+                                sl.checks.push_back(std::move(c));
+                            } else {
+                                sl.checks.push_back(**it);
+                            }
+                        }
                         }
                     }
                     const auto tc4 = Clock::now();
