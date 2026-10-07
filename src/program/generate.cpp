@@ -8935,11 +8935,13 @@ int main(int argc, char** argv) {
             // the park further down keeps it).  Off where slots lose their state otherwise (pipelined groups).
             const bool lazy_park = o.batch > 0 && o.pipeline_windows == 0 && o.batch_groups <= 1 &&
                                    conversations.enabled() && o.prompt_cache > 0;
-            auto held_by_idle_slot = [&](int except) -> bool {
+            auto held_by_slot = [&](int except) -> bool {
                 if (!live_ok || live.empty() || !live_imgs.empty()) return false;
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
-                    if (b == except || sl.active || !sl.cached || sl.img || sl.partial || sl.cvec != cvec_cached ||
+                    // a decoding slot counts too: an admission only takes a free slot, and the one decoding this
+                    // conversation keeps it (ids grow by what it generates) and stays cached when it ends
+                    if (b == except || (!sl.active && !sl.cached) || sl.img || sl.partial || sl.cvec != cvec_cached ||
                         sl.ids.size() < live.size())
                         continue;
                     if (std::equal(live.begin(), live.end(), sl.ids.begin())) return true;
@@ -8956,7 +8958,7 @@ int main(int argc, char** argv) {
                     // session and the outgoing park below keeps it
                     const bool main_is_slots = live_ok && live.size() <= d.ids.size() &&
                                                std::equal(live.begin(), live.end(), d.ids.begin());
-                    if (!main_is_slots && !held_by_idle_slot(admit_slot) && !park_current(0)) {
+                    if (!main_is_slots && !held_by_slot(admit_slot) && !park_current(0)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -9053,8 +9055,8 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            // lazy parking: an idle slot keeps the outgoing conversation, or this request continues it
-            const bool kept_elsewhere = lazy_park && (held_by_idle_slot(admit_slot) ||
+            // lazy parking: a slot (idle or decoding) keeps the outgoing conversation, or this request continues it
+            const bool kept_elsewhere = lazy_park && (held_by_slot(admit_slot) ||
                                                       (live_ok && starts_with(live, live_imgs)));
             if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !kept_elsewhere &&
                 !park_current(incoming ? incoming->bytes() : 0)) {
