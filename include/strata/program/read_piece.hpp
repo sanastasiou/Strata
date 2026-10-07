@@ -17,4 +17,10 @@ inline int64_t prompt_read_piece(int64_t chunk, bool split_idle, int64_t piece) 
     return std::max(chunk, piece / chunk * chunk);
 }
 
+// Where one run of that read ends: `piece` from prompt_read_piece, decided again at every boundary, so a read that
+// started beside a decoding slot goes back to whole pieces (or the whole rest) once no slot decodes.
+inline int64_t prompt_read_run_end(int64_t q, int64_t end, int64_t piece) {
+    return piece <= 0 ? end : std::min(end, q + piece);
+}
+
 } // namespace strata::program
