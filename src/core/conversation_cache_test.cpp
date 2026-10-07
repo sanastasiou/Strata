@@ -205,6 +205,45 @@ int main() {
               "an oversized put drops nothing");
     }
     {
+        // --batch: the outgoing chain is the slot's and holds NO checkpoint at the previous turn's boundary.
+        // Two conversations alternating on a lane parked a copy per turn and evicted each other's copies.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        std::vector<int32_t> a_hist = {1, 2, 3, 4, 10}, b_hist = {1, 2, 3, 4, 20};
+        for (int turn = 1; turn <= 6; ++turn) {
+            for (auto* h : {&a_hist, &b_hist}) {
+                SavedConversation s = image({});
+                s.live.ids = *h;
+                s.live.ids.push_back(900);                       // the reply as generated (stale tail)
+                s.checkpoints = {cp({1, 2, 3, 4}), cp(*h)};       // the turn boundary is the deepest point
+                const std::vector<int32_t> next_turn = [&] { auto v = *h; v.push_back(30); return v; }();
+                SavedConversation out = image({});
+                out.live.ids = next_turn;                          // next turn's live: continues past the boundary
+                out.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, (*h)[4]})};   // the slot's chain: root + a stride
+                                                                       // point, not this turn's boundary
+                check(cache.put(std::move(s)), "park this turn");
+                check(cache.put(std::move(out)), "park the next turn with a root-only chain");
+                h->push_back(30);
+                h->push_back((int32_t) turn);
+            }
+        }
+        check(cache.evictions() == 0, "alternating conversations under --batch evict nothing");
+        check(cache.size() <= 4, "at most a copy or two per conversation stays parked");
+        SavedConversation fork = image({1, 2, 3, 4, 10, 77, 78});
+        fork.checkpoints = {cp({1, 2, 3, 4})};
+        const size_t before = cache.superseded();
+        check(cache.put(std::move(fork)) && cache.superseded() == before,
+              "a fork that only shares the root supersedes nothing");
+        ConversationCache two(1 << 20, 4);
+        SavedConversation x = image({1, 2, 3, 50});
+        x.checkpoints = {cp({1, 2, 3})};                          // its deepest point lies inside the shared root
+        two.put(std::move(x));
+        SavedConversation longer = image({1, 2, 3, 4, 60, 61, 62, 63});
+        longer.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60, 61})};
+        check(two.put(std::move(longer)) && two.superseded() == 0 && two.size() == 2,
+              "a longer conversation sharing only the root does not drop a copy no deeper than it");
+    }
+    {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");

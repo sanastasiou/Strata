@@ -287,13 +287,22 @@ public:
                 if (k.ids == c.ids && k.imgs == c.imgs) return true;
             return false;
         };
+        // the outgoing chain's root (its shortest point, the system prompt's end): a copy whose deepest point is no
+        // deeper shares only that root with the outgoing conversation, so a prefix match there proves nothing
+        size_t root = 0;
+        for (const auto& k : checkpoints)
+            if (root == 0 || k.ids.size() < root) root = k.ids.size();
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
+            // or the outgoing live tokens simply continue past it: under --batch the chain is rebuilt from a slot
+            // and need not hold the old turn's boundary, yet the copy still adds only the stale tail
+            if (e.cvec == cvec && deepest && !deepest->ids.empty() &&
+                (held(*deepest) || (ids.size() > e.live.ids.size() && deepest->ids.size() > root &&
+                                    conversation_prefix(*deepest, ids, images) > 0))) {
                 bytes_ -= e.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
