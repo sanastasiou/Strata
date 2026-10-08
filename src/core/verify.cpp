@@ -2524,7 +2524,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
                            std::string& err) {
     using namespace strata::kernels;
     if (S < 1 || S > max_t_ || hbase < 0 ||
-        (next_ != nullptr && hbase + S > (int) slots_.size())) {
+        (next_ != nullptr && hbase > 0 && hbase + S > (int) slots_.size())) {   // pipelined groups: one row per slot from hbase
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
@@ -2540,10 +2540,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             }
         if (t > 0 && rows[t] == rows[t - 1] && pos[t] != pos[t - 1] + 1) {
             err = "verify: proposed rows must have consecutive positions";
-            return false;
-        }
-        if (t > 0 && rows[t] == rows[t - 1] && next_ != nullptr) {
-            err = "verify: grouped slot rows do not support a layer split yet";
             return false;
         }
     }
