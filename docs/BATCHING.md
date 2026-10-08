@@ -23,8 +23,12 @@ On one GPU with MTP (`--mtp` and `--spec`), `--batch-mtp` (in the config's `args
 server's environment) lets each batch slot verify one MTP proposal per window. It is opt-in; without it the batch
 behaviour described below is exactly the one without MTP. It needs VRAM per slot for the draft state and buffers, so
 check the engine's free-memory log before using it on a smaller card. If it cannot run (one slot, no `--mtp`, a layer
-split or helper GPU) the engine says so and batches as usual. RTX PRO 5000 owners measured +31% to +39% total
-throughput with 2 to 4 clients (a RX R9700 run too); it has not been validated with a layer split.
+split with two stages on one GPU, or `--batch-groups` above 1 on a layer split) the engine says so and batches as
+usual. RTX PRO 5000 owners measured +31% to +39% total throughput with 2 to 4 clients (a RX R9700 run too). On a
+layer split (2 x RTX 3090, `--batch 2`, 2 rows decoding) it measured +18% (prose) to +25% (agent-style code, also
+at ~100K context) per row, and -3% on a lone request (the slot drafters take ~0.1 GiB of the last stage's expert
+cache). Check it with `tools/batch_test.py --expect-batch-mtp` (batch tokens equal the solo tokens when the expert
+cache is the same size: `--pcie-frac 0 --adapt-swaps 0 --prompt-cache 0`).
 
 With a layer split, the engine options go into the config's `args`:
 

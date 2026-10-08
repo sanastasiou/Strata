@@ -3871,7 +3871,8 @@ int main(int argc, char** argv) {
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     if (batch_mtp) {
-        const char* why = strata::program::batch_mtp_refusal(o.batch, !o.mtp.empty(), o.spec, split_same, o.serve);
+        const char* why = strata::program::batch_mtp_refusal(o.batch, !o.mtp.empty(), o.spec, split_same, o.serve,
+                                                                 o.batch_groups, !stages.empty());
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
@@ -6738,7 +6739,7 @@ int main(int argc, char** argv) {
                     vs.n_slots = gs.cache.slots();
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       strata::program::batch_window_rows(batch_mtp, o.spec, o.batch, strata::kernels::kVerifyMaxT), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     split_drive.pcie_num[st] = pcie_num_of(gs.pcie_frac);
@@ -6800,13 +6801,13 @@ int main(int argc, char** argv) {
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
         ver.set_remote_expert_opt(remote_opt.get());
+        // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all.  Every stage's verifier.
         if (batch_mtp) {
             ver.set_batch_graph_limit(64);
             for (auto& sg : stages) sg->ver.set_batch_graph_limit(64);
         }
-   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      strata::program::batch_window_rows(batch_mtp, o.spec, o.batch, strata::kernels::kVerifyMaxT), err) ||
             (use_mtp && !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());

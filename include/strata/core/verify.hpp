@@ -151,7 +151,9 @@ public:
     // per window for all the sequences.  Row s's arithmetic is the single-token window's, so a slot's greedy
     // tokens are its solo greedy tokens (modulo the multi-token CPU kernel choice: STRATA_IQ_MT_MIN=1).
     //
-    // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
+    // Greedy only.  Drafts (MTP) are opt-in (--batch-mtp): a slot's rows are then [current token, one proposal], grouped
+    // consecutively, and `commit_slot_prefixes` keeps one or both; a layer split carries them through every stage.
+    // `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }

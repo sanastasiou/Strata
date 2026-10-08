@@ -5,7 +5,7 @@ windows (BGEN), greedy.  Every slot's tokens must equal its solo tokens; prints 
   python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 4 --n 4 \
       --extra "--layer-split 12,24,36 --trim-stage-weights --pcie-frac 0 --adapt-every 1000000"
 """
-import argparse, json, os, subprocess, sys, tempfile, threading, time
+import argparse, json, os, re, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -78,6 +78,9 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=0,
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
+    ap.add_argument("--expect-batch-mtp", action="store_true",
+                    help="STRATA_BATCH_MTP=1 must really run (also on a layer split): fail when the engine says "
+                         "--batch-mtp is off, or when no batch window carried a slot's current token and its proposal")
     ap.add_argument("--mt-min", default="1", help="STRATA_IQ_MT_MIN for the engine (1: exact; empty: the default)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
@@ -166,6 +169,14 @@ def main():
         Path(a.dump).write_text(json.dumps({"solo": solo, "batch": [got[i] for i in range(len(prompts))]}), encoding="utf-8")
     eng.send("QUIT")
     eng.p.wait(timeout=180)   # the next run needs the GPUs back
+    if a.expect_batch_mtp:
+        log = Path(eng.log_path).read_text(errors="replace")
+        grouped = re.search(r"captured the batch window over slots (\d+),\1\b", log) is not None   # one slot, two rows
+        if "--batch-mtp is off" in log or not grouped:
+            print("FAIL: --expect-batch-mtp, but "
+                  + ("the engine switched --batch-mtp off" if "--batch-mtp is off" in log else "no grouped batch window ran"))
+            return 3
+        print("batch MTP ran (grouped slot rows in the batch windows)")
     return 0 if ok else 2
 
 
