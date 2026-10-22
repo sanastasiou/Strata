@@ -134,6 +134,26 @@ class Lifeline(unittest.TestCase):
         self.assertTrue(self.wait_gone(info["child"]))
 
 
+class StartToken(unittest.TestCase):
+    """The ps-based start token names one process for its whole life: its state letters change while it runs."""
+
+    def _token(self, fn, ps_out):
+        from unittest import mock
+        done = subprocess.CompletedProcess([], 0, stdout=ps_out, stderr="")
+        with mock.patch("subprocess.run", return_value=done):
+            return fn(4242)
+
+    def test_a_running_child_and_the_same_child_asleep_have_one_token(self):
+        sys.path.insert(0, str(ROOT))
+        from serve import lifeline
+        from strata_control import procs
+        lstart = "Thu Oct 22 14:07:12 2026"
+        for fn in (lifeline._start_token, procs._ps_start_token):
+            self.assertEqual(self._token(fn, f"{lstart} R\n"), self._token(fn, f"{lstart} Ssl+\n"), fn.__name__)
+            self.assertFalse(self._token(fn, f"{lstart} Z+\n"), f"{fn.__name__}: a zombie has no token")
+            self.assertFalse(self._token(fn, ""), f"{fn.__name__}: no process, no token")
+
+
 if __name__ == "__main__":
     unittest.main()
 

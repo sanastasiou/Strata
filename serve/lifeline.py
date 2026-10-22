@@ -103,7 +103,8 @@ def start_of(p):
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(p)], capture_output=True, text=True, timeout=5).stdout.strip()
     except Exception:
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    lstart, _, stat = out.rpartition(" ")              # only lstart names the process; stat (R/S/...) changes as it runs
+    return None if not lstart or stat.startswith("Z") else "s:" + lstart
 os.set_blocking(0, True)
 data = b""
 while True:
@@ -139,7 +140,10 @@ def _start_token(pid: int) -> str:
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return "" if not out or out.endswith("Z") else "s:" + out
+    # lstart then stat: only lstart identifies the process. With stat in the token, a child that was running (R) when
+    # it was watched and sleeping (S) when its server died looked like another process, so the watcher left it alive.
+    lstart, _, stat = out.rpartition(" ")
+    return "" if not lstart or stat.startswith("Z") else "s:" + lstart
 
 
 def _watch(child: subprocess.Popen) -> None:

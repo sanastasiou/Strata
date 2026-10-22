@@ -70,12 +70,20 @@ def start_token(pid: int) -> str | None:
             return f"p:{p.create_time():.3f}"
         except (psutil.Error, OSError):
             return None
+    return _ps_start_token(pid)
+
+
+def _ps_start_token(pid: int) -> str | None:
+    """start_token from `ps` (a POSIX without /proc and without psutil, e.g. macOS)."""
     try:
         out = subprocess.run(["ps", "-o", "lstart=,stat=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return None
-    return None if not out or out.endswith("Z") else "s:" + out
+    # lstart then stat: only lstart identifies the process. stat (R, S, S+, Sl, ...) changes while the process runs, so
+    # a token that kept it named the same process twice differently; a zombie is any stat that starts with Z.
+    lstart, _, stat = out.rpartition(" ")
+    return None if not lstart or stat.startswith("Z") else "s:" + lstart
 
 
 def command_line(pid: int) -> list[str] | None:
