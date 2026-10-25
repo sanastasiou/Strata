@@ -1733,10 +1733,22 @@ ConvStateSizes conv_state_sizes(const strata::core::ModelGeometry& g, const stra
     return z;
 }
 
+/// #3350: the physical-RAM floor a checkpoint's running-state copy consults - the parking gate's
+/// --conversation-cache-min-free-mib, set once at serve start.  0: no gate (the copies run ungated, a
+/// failure is still a dropped checkpoint, never an exit).
+static std::atomic<uint64_t> g_ckpt_min_free_bytes{0};
+void set_checkpoint_ram_floor(int64_t min_free_mib) {
+    g_ckpt_min_free_bytes.store(min_free_mib > 0 ? (uint64_t) min_free_mib << 20 : 0, std::memory_order_relaxed);
+}
+
 /// Copies the running state out (this session's carve only).  The caller has synchronized the device.
+/// false = this checkpoint is dropped, not an error the request dies on: the copy is behind the parking
+/// gate's RAM admission, and a failed one freed everything it had allocated (conversation_state.cpp).
 bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, const strata::core::ModelGeometry& g) {
     std::string error;
-    if (strata::core::conversation_checkpoint_save(c, ss, g, error)) return true;
+    const auto saved = strata::core::conversation_checkpoint_save_admitted(
+        c, ss, g, g_ckpt_min_free_bytes.load(std::memory_order_relaxed), error);
+    if (saved == strata::core::ConversationCheckpointSave::saved) return true;
     std::fprintf(stderr, "strata serve: checkpoint save: %s\n", error.c_str());   // the caller's ERR has no reason
     return false;
 }
@@ -2957,6 +2969,8 @@ int main(int argc, char** argv) {
                              (long long) o.conversation_cache_min_free_mib);
             }
         }
+        // #3350: the prompt/serving checkpoint saves consult the parking gate's floor too
+        if (o.serve) set_checkpoint_ram_floor(o.conversation_cache_min_free_mib);
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -9630,8 +9644,14 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
+                // #3350: the capture's running-state copy can fail the same way the parking gate just refused
+                // (its admission raced): skipping the park is the same refusal, not an engine exit.
                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
+                        std::move(reuse), &reused_bytes)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (capture: %s)\n", err.c_str());
+                    err.clear();   // a recoverable miss must not poison the batched draft prefill's error channel
+                    return true;
+                }
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -9639,8 +9659,12 @@ int main(int argc, char** argv) {
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
+                            std::move(stage_reuse[k]), &reused_bytes)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d capture: %s)\n",
+                                     st->dev, err.c_str());
+                        err.clear();
+                        return true;
+                    }
                     image.stage_images.push_back(std::move(part));
                 }
                 const auto mem_after = strata::core::sample_host_memory();
@@ -9957,7 +9981,13 @@ int main(int argc, char** argv) {
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
-                if (!saved) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                if (!saved && !ckpt_why.empty()) { e = "saving a conversation checkpoint failed" + ckpt_why; return false; }
+                // #3350: only the GPU-hang reason (#613) is fatal; a running-state copy that could not get
+                // host RAM drops this checkpoint - the prompt read goes on, the next chunk's checkpoint (or a
+                // later restore of an earlier one) makes up for it.
+                if (!saved)
+                    std::fprintf(stderr, "strata serve: no checkpoint at %lld: its running-state copy failed; "
+                                         "the read goes on\n", (long long) done);
                 if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
                 if (tail_checkpoint) pp_tail_saved = true;
             }
@@ -9974,7 +10004,11 @@ int main(int argc, char** argv) {
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
-                    if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
+                    // #3350: a part whose running-state copy cannot get host RAM is dropped, not fatal: the
+                    // last stage sees a set without a part for this stage (empty payload) at the merge below
+                    // ("an incomplete set: no checkpoint here") and the read goes on.  (checkpoint_save is
+                    // behind the parking gate's RAM admission and frees what a failed copy had allocated.)
+                    if (!checkpoint_save(part, stage_ss, g)) part = ConvCheckpoint{};
                     std::lock_guard<std::mutex> lk(part_mu);
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
@@ -14239,8 +14273,13 @@ int main(int argc, char** argv) {
                 at = to;
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
-                    std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
-                    return 1;
+                    if (!ckpt_why.empty()) {   // #613: the GPU itself - fatal, as before
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    // #3350: the copy could not get host RAM: no boundary checkpoint, the request goes on
+                    std::fprintf(stderr, "strata serve: no boundary checkpoint at %lld: its running-state copy "
+                                         "failed; the request goes on\n", (long long) to);
                 }
                 if (to == pin_at && !pin_checkpoint(pin_at))
                     std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
