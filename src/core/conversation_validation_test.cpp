@@ -257,6 +257,42 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_checkpoint_save(doomed, ss, g, error), "running-state copy OOM is reported as a failed save");
     check(error.find("out of memory") != std::string::npos, "the failed copy names CUDA's out-of-memory");
     check(cudaGetLastError() == cudaSuccess, "a failed checkpoint copy leaves no sticky CUDA error");
+
+    // the admission the save now sits behind (#3350): this copy's own bytes, counted against the parking
+    // gate's floor, refused before any CUDA call.
+    reset();
+    size_t payload = 0;
+    ConversationCheckpoint sized;
+    sized.ids = image.live.ids; sized.imgs = image.live.imgs;
+    check(conversation_checkpoint_payload_bytes(g, ss, sized, payload, error), "checkpoint payload byte count");
+    ConversationStateSizes zk;   // the fixture's `z` was reset by the overflow checks above
+    check(conversation_session_sizes(g, ss, zk, error) && payload == zk.gdn + (ple ? zk.ple : (size_t)0) +
+              (size_t)ss.qsa_alloc * (zk.tail + zk.dead + zk.block_pos) +
+              sized.ids.size() * sizeof(int32_t) + sized.imgs.size() * sizeof(ConversationImageKey),
+          "payload counts the session's carved running state and both lists");
+    const uint64_t floor_bytes = 4096;
+    ConversationCheckpoint refused;
+    refused.ids = sized.ids; refused.imgs = sized.imgs;   // same lists as `payload` was computed with
+    check(conversation_checkpoint_save_admitted(refused, ss, g, floor_bytes, error, floor_bytes + payload - 1) ==
+              ConversationCheckpointSave::declined && copy_calls == 0,
+          "admission refuses below the floor without a CUDA call");
+    check(error.find("physical RAM admission") != std::string::npos, "the refusal says what the gate saw");
+    check(refused.gdn.empty() && refused.ids == image.live.ids, "a refused save allocates nothing and keeps its list");
+    ConversationCheckpoint accepted;
+    accepted.ids = sized.ids; accepted.imgs = sized.imgs;
+    check(conversation_checkpoint_save_admitted(accepted, ss, g, floor_bytes, error, floor_bytes + payload) ==
+              ConversationCheckpointSave::saved && accepted.gdn.size() == zk.gdn,
+          "admission at the exact boundary saves");
+    reset(); fail_copy = 1; fail_copy_err = cudaErrorMemoryAllocation;
+    ConversationCheckpoint failed_save;
+    failed_save.ids = image.live.ids;
+    check(conversation_checkpoint_save_admitted(failed_save, ss, g, floor_bytes, error,
+                                                floor_bytes + ((uint64_t)1 << 30)) ==
+              ConversationCheckpointSave::failed, "an admitted copy that still fails returns failed: the caller drops the checkpoint");
+    check(failed_save.gdn.capacity() == 0 && failed_save.ple.capacity() == 0 &&
+          failed_save.tails.capacity() == 0 && failed_save.dead.capacity() == 0 &&
+          failed_save.block_pos.capacity() == 0, "the failed save freed every payload vector it had allocated");
+    check(cudaGetLastError() == cudaSuccess, "the admitted path leaves no sticky CUDA error either");
 #endif
 }
 }

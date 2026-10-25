@@ -5,6 +5,8 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 
 namespace strata::core {
@@ -70,6 +72,25 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// The host bytes conversation_checkpoint_save allocates for this checkpoint: the running-state payload of
+/// the session's own carve plus its token/image lists (#3350 - the RAM a save adds that nothing else counts).
+bool conversation_checkpoint_payload_bytes(const ModelGeometry& g, const SessionState& session,
+                                           const ConversationCheckpoint& checkpoint, size_t& bytes,
+                                           std::string& error);
+enum class ConversationCheckpointSave { saved, declined, failed };
+/// Gives back the five running-state vectors of a checkpoint (capacity included) without touching its
+/// token/image lists; conversation_checkpoint_save_admitted does this when the copy failed.
+void conversation_checkpoint_free_payload(ConversationCheckpoint& checkpoint);
+/// #3350: conversation_checkpoint_save behind the same physical-RAM gate the parking path uses (see
+/// conversation_memory.hpp): `min_free_bytes` is the --conversation-cache-min-free-mib floor, and the copy
+/// runs only when the payload fits above it (`available_ram` sampled when nullopt - tests pass one).
+/// A decline performs no CUDA call. A failed copy frees the payload the save had allocated and, because a
+/// pageable cudaMemcpyAsync that cannot pin its staging is a recoverable host-allocation failure and not a
+/// device fault, clears the CUDA last-error slot (the save's copy() does that), so a dropped checkpoint
+/// never turns the serve loop's device-fault check into an engine exit.
+ConversationCheckpointSave conversation_checkpoint_save_admitted(
+    ConversationCheckpoint& checkpoint, const SessionState& session, const ModelGeometry& g,
+    uint64_t min_free_bytes, std::string& error, std::optional<uint64_t> available_ram = std::nullopt);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two

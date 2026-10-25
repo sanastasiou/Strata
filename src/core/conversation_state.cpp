@@ -1,10 +1,12 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_memory.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
 
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <new>
 
 namespace strata::core {
 namespace {
@@ -36,6 +38,13 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool que
     const auto status = conversation_detail::copy_nonblocking(dst, src, bytes, queued);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
+    // #3350: into a PAGEABLE host destination (the checkpoint vectors, parked state), cudaMemcpyAsync needs the
+    // driver to pin its own staging; when host RAM has hit its floor that returns "out of memory". It is a
+    // recoverable host-allocation failure, not a device fault, and it is otherwise sticky: the serve loop ends
+    // the engine with _Exit(1) on the next failed step because cudaPeekAtLastError still reports it
+    // (generate.cpp, #224's device-fault check). Consume it here, where the failure is reported and droppable;
+    // a real device fault stays sticky and every later call still fails, so this cannot hide one.
+    cudaGetLastError();
     return false;
 }
 
@@ -182,6 +191,58 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
             !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
     }
     return true;
+}
+
+bool conversation_checkpoint_payload_bytes(const ModelGeometry& g, const SessionState& ss,
+                                           const ConversationCheckpoint& c, size_t& bytes, std::string& error) {
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    const size_t layers = owned_qsa(ss);
+    size_t ids = 0, images = 0, tails = 0, dead = 0, positions = 0;
+    if (!product(ids, {c.ids.size(), sizeof(int32_t)}) ||
+        !product(images, {c.imgs.size(), sizeof(ConversationImageKey)}) ||
+        !product(tails, {layers, z.tail}) || !product(dead, {layers, z.dead}) ||
+        !product(positions, {layers, z.block_pos})) return fail(error, "checkpoint payload byte count overflow");
+    bytes = 0;
+    for (size_t n : {ids, images, z.gdn, (ss.ple_hist ? z.ple : size_t(0)), tails, dead, positions})
+        if (!add(bytes, n)) return fail(error, "checkpoint payload byte count overflow");
+    return true;
+}
+
+void conversation_checkpoint_free_payload(ConversationCheckpoint& c) {
+    for (auto* v : {&c.gdn, &c.ple, &c.tails, &c.dead, &c.block_pos}) std::vector<uint8_t>().swap(*v);
+}
+
+ConversationCheckpointSave conversation_checkpoint_save_admitted(
+    ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g,
+    uint64_t min_free_bytes, std::string& error, std::optional<uint64_t> available_ram) {
+    size_t payload = 0;
+    if (!conversation_checkpoint_payload_bytes(g, ss, c, payload, error))
+        return ConversationCheckpointSave::failed;
+    if (min_free_bytes != 0) {
+        std::optional<HostMemoryReading> mem;
+        std::optional<uint64_t> available = available_ram;
+        if (!available) { mem = sample_host_memory(); if (mem) available = mem->available; }
+        if (!conversation_memory_admit(available, payload, min_free_bytes)) {
+            // the parking gate's words (#3350): the copy is refused, the caller drops this checkpoint and serves
+            error = "conversation snapshot running-state copy: declined (physical RAM admission; need " +
+                    std::to_string(payload >> 20) + " MiB plus " + std::to_string(min_free_bytes >> 20) +
+                    " MiB floor, " +
+                    (available ? std::to_string(*available >> 20) + " MiB available" +
+                                 (mem ? std::string(", source ") + memory_source_name(mem->source) : std::string())
+                                : std::string("RAM telemetry unavailable")) + ")";
+            return ConversationCheckpointSave::declined;
+        }
+    }
+    try {
+        if (conversation_checkpoint_save(c, ss, g, error)) return ConversationCheckpointSave::saved;
+    } catch (const std::bad_alloc&) {
+        // the payload vectors themselves could not be committed: same outcome as a failed copy, and the
+        // serve loop's #752 rule applies here too - a dropped checkpoint, not an ended process
+        error = "conversation snapshot running-state copy: host allocation failed";
+    }
+    conversation_checkpoint_free_payload(c);   // the resize that preceded the failure gave up its bytes
+    return ConversationCheckpointSave::failed;
 }
 
 bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionState& ss,
