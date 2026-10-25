@@ -16,10 +16,12 @@
 // host-backend fault injection, not a claim of hardware-failure recovery.
 namespace {
 int copy_calls = 0, sync_calls = 0, fail_copy = 0, fail_sync = 0;
+cudaError_t fail_copy_err = cudaErrorInvalidValue;   // #3350: the injected failure can be CUDA's out-of-memory
+cudaError_t last_error = cudaSuccess;                // the last error a failing wrap reports, as the driver's does
 size_t copied_bytes = 0;
 }
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
-    if (++copy_calls == fail_copy) return cudaErrorInvalidValue;
+    if (++copy_calls == fail_copy) { last_error = fail_copy_err; return fail_copy_err; }
     copied_bytes += n;
     std::memcpy(dst, src, n);
     return cudaSuccess;
@@ -36,7 +38,11 @@ extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t) { return cudaS
 extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
-extern "C" cudaError_t __wrap_cudaGetLastError() { return cudaSuccess; }
+extern "C" cudaError_t __wrap_cudaGetLastError() {
+    const cudaError_t e = last_error;
+    last_error = cudaSuccess;   // the real cudaGetLastError consumes the sticky slot
+    return e;
+}
 #endif
 
 using namespace strata::core;
@@ -181,6 +187,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         std::fill(gdn.begin(),gdn.end(),0xa5); std::fill(history.begin(),history.end(),0xa5);
         ss.ple_prev[0] = ss.ple_prev[1] = -1;
         copy_calls = sync_calls = fail_copy = fail_sync = 0;
+        fail_copy_err = cudaErrorInvalidValue; last_error = cudaSuccess;
     };
     reset(); fail_sync = 1;
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::transfer_failed,
@@ -238,6 +245,18 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+
+    // #3350: a checkpoint's running-state copy can fail because the pageable host destination has no RAM for
+    // the driver's pinned staging (CUDA's "out of memory" from cudaMemcpyAsync).  It is not a device fault:
+    // the save must report it AND leave the sticky last-error slot clear, because the serve loop's fatal check
+    // (cudaPeekAtLastError before _Exit(1), generate.cpp) reads that slot and would exit the engine over a
+    // refused optimization.
+    reset(); fail_copy = 1; fail_copy_err = cudaErrorMemoryAllocation;
+    ConversationCheckpoint doomed;
+    doomed.ids = image.live.ids;
+    check(!conversation_checkpoint_save(doomed, ss, g, error), "running-state copy OOM is reported as a failed save");
+    check(error.find("out of memory") != std::string::npos, "the failed copy names CUDA's out-of-memory");
+    check(cudaGetLastError() == cudaSuccess, "a failed checkpoint copy leaves no sticky CUDA error");
 #endif
 }
 }
