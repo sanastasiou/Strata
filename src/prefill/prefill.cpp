@@ -51,6 +51,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
+#include "strata/core/split_handoff.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the optional approximate-prefill plan (research, off by default)
 
@@ -4798,7 +4799,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             cudaStreamWaitEvent(ps, P.ev_in, 0);
                             if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
                             pe.mark(kPeMoeIn, ps);
-                            if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                            if (P.p2p) {
+                                cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
+                                strata::core::add_split_handoff((uint64_t) T * N * 4);   // the peer's activations cross the link
+                            }
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
                             else copy_f32_wide(P.mixed, P.host_x, T * N, ps);
                             P.back_at = rows_local;
@@ -4964,9 +4968,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     }
                                     cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
                                     cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
-                                    if (P.p2p)
+                                    if (P.p2p) {
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
                                                             (size_t) nr * N * 4, P.s_out);
+                                        strata::core::add_split_handoff((uint64_t) nr * N * 4);   // the group's rows back
+                                    }
                                     else   // the primary reads them when it combines (below)
                                         cudaMemcpyAsync(P.host_rows + (size_t) r0 * N, P.Dm_b[b], (size_t) nr * N * 4,
                                                         cudaMemcpyDeviceToHost, P.s_out);
@@ -5033,6 +5039,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         cudaStreamWaitEvent(P.s_out, P.ev_grp[g2], 0);
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm + (size_t) r0 * N,
                                                             P.dev, (size_t) nr * N * 4, P.s_out);
+                                        strata::core::add_split_handoff((uint64_t) nr * N * 4);   // this group's rows back
                                     }
                                 }
                             }
@@ -5051,6 +5058,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 P.out_pending = true;
                             } else {
                                 cudaMemcpyPeerAsync(m.Dm + (size_t) rows_local * N, prevd, P.Dm, P.dev, (size_t) rows_peer * N * 4, ps);
+                                strata::core::add_split_handoff((uint64_t) rows_peer * N * 4);   // the peer's rows back at once
                                 cudaEventRecord(P.ev_done, ps);
                             }
                             pe.mark(kPeIdle, ps);

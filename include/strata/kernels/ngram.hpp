@@ -209,6 +209,9 @@ public:
     /// Bytes of the whole table (rows x row bytes) while open; 0 when closed.  The residency policy in
     /// generate.cpp sizes the table with this before it decides to keep it in RAM.
     uint64_t table_bytes() const;
+    /// The table's mapped extent in RAM (rows x row bytes), 0 in Direct mode (the mapping is dropped after the
+    /// header parse and rows are read unbuffered from the SSD).  What `--ple-io ram` occupies and mlocks.
+    uint64_t mapped_bytes() const;
     /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
     const char* format() const;
 

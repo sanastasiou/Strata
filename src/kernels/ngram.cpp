@@ -523,6 +523,11 @@ const char* PleTable::format() const { return impl_->fmt->name; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
 uint64_t PleTable::table_bytes() const { return impl_->n_rows * (uint64_t) impl_->rb; }
+uint64_t PleTable::mapped_bytes() const {
+    // the whole table's extent when it is mapped (Mmap mode: `--ple-io mmap`, and `ram` with the lock on top);
+    // Direct mode drops its mapping after the header parse, so it occupies no RAM to report
+    return impl_->mode == PleIo::Mmap ? impl_->n_rows * (uint64_t) impl_->rb : 0;
+}
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 
 void PleTable::read_row(uint32_t row, float* out160) const {
