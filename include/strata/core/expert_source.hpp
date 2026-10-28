@@ -1322,6 +1322,11 @@ public:
     bool ram_short() const { return ram_short_; }
     /// #633: set by `open` when the RAM available is less than the arena needs (a recommendation; it still loads)
     const std::string& ram_warning() const { return ram_warning_; }
+    /// Telemetry G4: the serve INFO line's `arena_shared` flag, directly printable as 1|0.  1 only when THIS arena
+    /// was actually attached as a shared MAP_SHARED file (--shared-expert-arena, e.g. /dev/shm/strata-split-arena.bin):
+    /// a STRATA_ARENA_MMAP start mapping experts.bin read-only and an ordinary anonymous arena are 0.  The value is
+    /// taken from the arena `open()` attached, never from the option or the environment the process was given.
+    int arena_shared() const { return arena_shared_ ? 1 : 0; }
     uint64_t pinned_arena_bytes() const { return pinned_bytes_; }   ///< what the driver registered (the pinned prefix, or the total by need)
     double load_gib_per_second() const { return gib_per_s_; }
     // Loader fix: the load, split.  `load_seconds()` is the wall clock of the load loop; the other two are
@@ -1344,6 +1349,7 @@ private:
     std::string note_;
     std::string ram_warning_;
     bool ram_short_ = false;
+    bool arena_shared_ = false;      ///< open() attached the arena as a shared MAP_SHARED file (the G4 arena_shared flag)
     double gib_per_s_ = 0.0;
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;
