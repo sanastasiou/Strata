@@ -246,6 +246,28 @@ class _Amd:
         return out
 
 
+def numa_node(core, sysfs=None):
+    """The NUMA node that owns a CPU core: the `node<N>` entry of /sys/devices/system/cpu/cpu<N> (a container sees the
+    host's sysfs).  None when the folder or the entry is not there (Windows, a container with /sys/devices hidden)."""
+    d = os.path.join(sysfs or SYSFS, "devices", "system", "cpu", f"cpu{core}")
+    try:
+        nodes = sorted(n for n in os.listdir(d) if n.startswith("node") and n[4:].isdigit())
+    except OSError:
+        return None
+    return int(nodes[0][4:]) if nodes else None
+
+
+def cpu_affinity():
+    """The cores this process may run on (`os.sched_getaffinity`, Linux; None on Windows and where it is missing):
+    the cpuset a pinned container was given - what the Monitor's per-core grid must show, not every core of the host."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        return sorted(os.sched_getaffinity(0))
+    except OSError:
+        return None
+
+
 def gpu_reader(index=0, amd=False):
     """The card's readings: NVML (NVIDIA), or the amdgpu sysfs files with the AMD backend (#301)."""
     return _Amd(index) if amd else _Nvml(index)
@@ -348,6 +370,7 @@ class Telemetry:
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
+        self.cpuset = cpu_affinity()
         self.static = {
             "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
             "gpu_count": len(self.gpus),
@@ -359,6 +382,10 @@ class Telemetry:
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
             "threads": os.cpu_count(),
             "psutil": self.ps is not None,
+            # the cores this process is pinned to (a container's cpuset) and the NUMA node of the first one: what the
+            # engine actually runs on, which the host-wide counts above do not say
+            "cpuset": self.cpuset,
+            "numa_node": numa_node(self.cpuset[0]) if self.cpuset else None,
         }
         self._disk_prev = None
         self._stop = threading.Event()
@@ -395,13 +422,22 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # each card's own PCIe rate and link: the summed gpu_* readings above hide which card carries the
+                # traffic, and only the first card's gen/width survives the sum (a split's x8 card reads as x16)
                 s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
+                              "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb"),
+                              "pcie_gen": r.get("pcie_gen"), "pcie_width": r.get("pcie_width")}
                              for i, r in reads]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
             try:
-                s["cpu"] = self.ps.cpu_percent(interval=None)
+                # one per-core reading serves both numbers: the host-wide average (psutil's own aggregate is that
+                # mean) and the engine's own cores - a pinned container's cpuset, not every core of the host
+                per = self.ps.cpu_percent(interval=None, percpu=True)
+                s["cpu"] = sum(per) / len(per) if per else None
+                if self.cpuset and per:
+                    s["cpu_cores"] = [{"core": c, "util": per[c]} for c in self.cpuset if c < len(per)]
                 vm = self.ps.virtual_memory()
                 s["ram_used"], s["ram_total"] = vm.total - vm.available, vm.total
             except (OSError, RuntimeError):
@@ -426,8 +462,8 @@ class Telemetry:
             s = self.sample()
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "split_handoff_mb",
+                          "cpu", "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)

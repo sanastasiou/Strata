@@ -926,6 +926,8 @@ class StrataEngine:
             self.last.update(prompt_read=int(f[14]))
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
+        if len(f) >= 17:                                  # fork telemetry: the layer split's GPU<->GPU hand-off,
+            self.last.update(split_handoff_cum=int(f[16]))  # the engine's CUMULATIVE counter (the service takes deltas)
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -1126,10 +1128,12 @@ class StrataEngine:
         return None
 
     def _apply_bdone(self, f: list[str]) -> None:
-        """`BDONE <slot> <produced> <finish> <ms>` into this request's figures."""
+        """`BDONE <slot> <produced> <finish> <ms> [hand-off bytes]` into this request's figures."""
         if len(f) >= 5 and isinstance(self.last, dict):
             self.last = {**self.last, "finish": f[3], "decode_ms": float(f[4]),
                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
+            if len(f) >= 6 and f[5].isdigit():            # the engine's cumulative split hand-off counter
+                self.last["split_handoff_cum"] = int(f[5])
 
     def _bdone_after_eos(self, slot: int, wait_s: float = 2.0):
         """#1869: a request in a slot whose consumer left at the stop token has its BDONE right behind it (the engine prints it
@@ -2839,7 +2843,12 @@ class Service:
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0,
-                       "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
+                       "drafts_offered": 0, "drafts_accepted": 0,   # #457: the MTP drafts, summed where reported
+                       "split_handoff_bytes": 0}   # layer split: GPU<->GPU hand-off bytes (the engine's DONE counter)
+        # the engine's cumulative hand-off counter as last seen (its DONE/BDONE lines carry it; it starts over when
+        # the engine restarts) and the 1 Hz sampler's previous (time, total) for the hardware rate
+        self._handoff_cum = 0
+        self._handoff_prev = None
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         from serve.prometheus import Latencies
         self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
@@ -3197,7 +3206,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "split_handoff_mb": self._split_handoff_mb()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -3241,6 +3251,17 @@ class Service:
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+
+    def _split_handoff_mb(self):
+        """The layer split's GPU<->GPU hand-off rate in MB/s, from the difference of the running total between two
+        1 Hz samples.  The engine reports its counter on DONE/BDONE, so a long request's hand-off shows at its end."""
+        now = time.time()
+        with self.status_lock:
+            v = self.totals.get("split_handoff_bytes", 0)
+        prev, self._handoff_prev = self._handoff_prev, (now, v)
+        if prev is None or now <= prev[0] or v < prev[1]:
+            return 0.0
+        return (v - prev[1]) / (now - prev[0]) / 2**20
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
@@ -4038,6 +4059,13 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            # the engine's cumulative hand-off counter -> this request's share: the difference since
+                            # the last DONE/BDONE settled (the whole counter on an engine restart, which starts over)
+                            handoff = None
+                            cum = last.get("split_handoff_cum")
+                            if cum is not None:
+                                handoff = cum - self._handoff_cum if cum >= self._handoff_cum else cum
+                                self._handoff_cum = cum
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -4056,7 +4084,10 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                # the layer split's GPU<->GPU hand-off bytes for this request (None: no split, or an
+                                # engine that does not report the counter)
+                                "split_handoff_bytes": handoff})
                             t = self.totals
                             t["requests"] += 1
                             t["prompt_tokens"] += seen
@@ -4066,6 +4097,7 @@ class Service:
                             t["decode_ms"] += last.get("decode_ms") or 0.0
                             t["drafts_offered"] += last.get("drafts_offered") or 0
                             t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                            t["split_handoff_bytes"] += handoff or 0
                             ft0 = st.get("first_token")             # this request's own (#465: one per request)
                             self.latencies.observe(ft0 - started if ft0 else None, n,
                                                    (last.get("decode_ms") or 0.0) / 1000, time.time() - started)

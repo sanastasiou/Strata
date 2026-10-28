@@ -201,6 +201,9 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the OS lock succeeded (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
+    /// The table's mapped extent in RAM (rows x row bytes), 0 in Direct mode (the mapping is dropped after the
+    /// header parse and rows are read unbuffered from the SSD).  What `--ple-io ram` occupies and mlocks.
+    uint64_t mapped_bytes() const;
     /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
     const char* format() const;
 

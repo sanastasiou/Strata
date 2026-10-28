@@ -12,6 +12,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/split_handoff.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -2304,6 +2305,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        add_split_handoff((uint64_t) T * (uint64_t) handoff_floats(g) * 4);   // the window's rows crossed to the next stage
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -2871,7 +2873,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cudaStreamSynchronize(copy_);
         if (prof_on_) collect_profile();
         ++windows;
-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        if (le_ < g.n_layers) {   // the window's rows crossed to the next stage
+            add_split_handoff((uint64_t) S * (uint64_t) handoff_floats(g) * 4);
+            return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+        }
         if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
@@ -2935,7 +2940,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     cudaStreamSynchronize(copy_);
     if (prof_on_) collect_profile();
     ++windows;
-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    if (le_ < g.n_layers) {   // the window's rows crossed to the next stage
+        add_split_handoff((uint64_t) S * (uint64_t) handoff_floats(g) * 4);
+        return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    }
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(S, last_pos_b_);
@@ -3399,7 +3407,10 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
     if (fl_prof_) accumulate_profile(prof_pin_);
     ++windows;
     trace_ev("DONE (pipelined)", -1, -1, (int64_t) (now_ms() - fl_launch_ms_));
-    if (le_ < g.n_layers) return true;   // an earlier stage: the hand-off is written
+    if (le_ < g.n_layers) {   // an earlier stage: the hand-off is written
+        add_split_handoff((uint64_t) fl_T_ * (uint64_t) handoff_floats(g) * 4);
+        return true;
+    }
     const int T = fl_T_;
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)

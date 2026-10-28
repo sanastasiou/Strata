@@ -2433,6 +2433,63 @@ class CancelledRead(unittest.TestCase):
         self.assertEqual(m["totals"]["prompt_tokens"], 8 + 2 * total)
 
 
+class SplitHandoff(unittest.TestCase):
+    """Fork telemetry G2: the engine reports its CUMULATIVE layer-split GPU<->GPU hand-off counter as the trailing
+    field of DONE/BDONE; the service differences it into per-request bytes (requests[]), a running total (totals)
+    and a 1 Hz rate (hardware.split_handoff_mb).  An engine restart starts the counter over: the service then takes
+    the new counter whole, never a negative delta."""
+
+    def test_parse_done_cum_field(self):
+        e = SimpleNamespace()
+        StrataEngine._parse_done(e, "DONE 4 20 40.0 30.0 stop 0 0 0 0 0 0 0 0.0 5 7 12288")
+        self.assertEqual((e.last["offloaded"], e.last["split_handoff_cum"]), (7, 12288))
+        StrataEngine._parse_done(e, "DONE 4 20 40.0 30.0 stop 0 0 0 0 0 0 0 0.0 5 7")
+        self.assertNotIn("split_handoff_cum", e.last)          # an engine that does not report it
+
+    def test_apply_bdone_cum_field(self):
+        e = SimpleNamespace(last={"generated": 1})
+        StrataEngine._apply_bdone(e, "BDONE 3 4 stop 120.0 99".split())
+        self.assertEqual((e.last["finish"], e.last["split_handoff_cum"]), ("stop", 99))
+        e = SimpleNamespace(last={"generated": 1})
+        StrataEngine._apply_bdone(e, "BDONE 3 4 stop 120.0".split())   # an engine that does not report it
+        self.assertNotIn("split_handoff_cum", e.last)
+
+    def test_deltas_total_and_history(self):
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 0 0 0 0 0 0 0 0.0 20 0 1000",    # 1000 bytes handed off
+            "DONE 4 20 40.0 30.0 stop 0 0 0 0 0 0 0 0.0 20 0 2500",    # 1500 more
+            "DONE 4 20 40.0 30.0 stop 0 0 0 0 0 0 0 0.0 20 0 400"])    # engine restarted: counter starts over
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for _ in range(3):
+                body = json.dumps({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]})
+                with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body.encode(),
+                                                                   headers={"Content-Type": "application/json"}),
+                                            timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+            with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
+                m = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        rows = m["requests"]                                          # newest first
+        self.assertEqual([r["split_handoff_bytes"] for r in rows], [400, 1500, 1000])
+        self.assertEqual(m["totals"]["split_handoff_bytes"], 2900)
+
+    def test_hardware_rate(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.totals["split_handoff_bytes"] = 2 * 2**20
+        self.assertEqual(svc._split_handoff_mb(), 0.0)                # the first sample only primes the difference
+        time.sleep(0.05)
+        svc.totals["split_handoff_bytes"] = 3 * 2**20
+        self.assertGreater(svc._split_handoff_mb(), 0.0)              # 2 MiB moved between the samples
+
+
 class HeldBackArgKeepalive(unittest.TestCase):
     """#1666: with stream_tools a tool call's array or object argument is held until it is whole, so a big one
     left the stream silent for minutes while tokens were generated - a client's idle timeout (Forge's is 120 s)
@@ -3970,7 +4027,7 @@ class StatusHandover(unittest.TestCase):
 
 FAKE_STRATA = '''import pathlib, sys, time
 gate = pathlib.Path(sys.argv[sys.argv.index("--gate") + 1])
-print("INFO engine=0.0.0", flush=True)
+print("INFO engine=0.0.0 ple_io=ram ple_mib=29491", flush=True)
 while not gate.exists():                     # the test says when the engine is "ready"
     time.sleep(0.01)
 print("READY 4096 stop", flush=True)
@@ -3985,6 +4042,29 @@ if fail.exists():                            # this start fails before READY (as
     fail.unlink()
     sys.exit(1)
 ''' + FAKE_STRATA.split("\n", 1)[1]
+
+
+class PleInfoLine(unittest.TestCase):
+    """Fork telemetry G3: the engine's INFO line reports the PLE table's residency (`ple_io=direct|mmap|ram|none`,
+    `ple_mib` mapped); the serve loop's generic INFO parser puts both in engine.info, and GET /metrics' engine
+    block shows them unchanged."""
+
+    def test_info_line_reaches_engine_info(self):
+        from unittest import mock
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script, gate = Path(d) / "fake_strata.py", Path(d) / "ready"
+            script.write_text(FAKE_STRATA, encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                gate.touch()
+                eng = StrataEngine("strata", ["--gate", str(gate)])
+                try:
+                    self.assertEqual((eng.info.get("ple_io"), eng.info.get("ple_mib")), ("ram", 29491))
+                finally:
+                    gate.touch()
+                    eng.unload()
 
 
 class RestartWindow(unittest.TestCase):
@@ -4287,7 +4367,8 @@ class TelemetryNoDisks(unittest.TestCase):
     def test_sampler_runs_without_disk_counters(self):
         from serve import telemetry
         vm = SimpleNamespace(total=64 * 2**30, available=40 * 2**30)
-        fake = SimpleNamespace(cpu_count=lambda logical=True: 8, cpu_percent=lambda interval=None: 12.5,
+        fake = SimpleNamespace(cpu_count=lambda logical=True: 8,
+                               cpu_percent=lambda interval=None, percpu=False: [12.5] * 8 if percpu else 12.5,
                                virtual_memory=lambda: vm, disk_io_counters=lambda: None)
         with mock.patch.dict(sys.modules, {"psutil": fake}):
             t = telemetry.Telemetry(extra=lambda: {"tok_s": 1.5})
@@ -4300,6 +4381,77 @@ class TelemetryNoDisks(unittest.TestCase):
                 self.assertEqual(now.get("ram_used"), 24 * 2**30)
                 self.assertIsNone(now.get("disk_read_mb"))
                 self.assertIsNone(t.sample()["disk_write_mb"])
+            finally:
+                t.close()
+
+
+class SplitCardTelemetry(unittest.TestCase):
+    """Fork telemetry G1/G5/G6: each gpus[] entry carries its own PCIe rate and link (the summed gpu_* readings hide
+    which card carries the traffic, and only the first card's gen/width survived the sum: a split's x8 card read as
+    x16); the sampler reports the cores the process is pinned to (a container's cpuset) with their live load, and
+    the NUMA node of the first one."""
+
+    NO_GPU = {"ok": lambda: False, "name": lambda: None}
+
+    class FakeCard:
+        def __init__(self, i): self.i = i
+        def ok(self): return True
+        def name(self): return f"Fake {self.i}"
+        def read(self):
+            return {"util": 10 * self.i, "mem_used": 1 << 30, "mem_total": 2 << 30, "temp": 50 + self.i,
+                    "power": 100.0, "power_limit": 300.0, "pcie_gen": 3, "pcie_gen_max": 3,
+                    "pcie_width": 16 if self.i == 0 else 8,        # the x8 card of a pair (docs: GPU0/3 run x8)
+                    "pcie_rx_mb": 400.0 + self.i, "pcie_tx_mb": 70.0 + self.i}
+
+    def test_per_card_pcie_in_gpus(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry, "gpu_reader", lambda i, amd=False: self.FakeCard(i)):
+            t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1])
+            try:
+                s = t.sample()
+                self.assertEqual([(g["index"], g["pcie_rx_mb"], g["pcie_tx_mb"], g["pcie_gen"], g["pcie_width"])
+                                  for g in s["gpus"]], [(0, 400.0, 70.0, 3, 16), (1, 401.0, 71.0, 3, 8)])
+                self.assertEqual(s["gpu_pcie_rx_mb"], 801.0)        # the summed readings stay as they were
+            finally:
+                t.close()
+
+    def test_cpuset_per_core_and_numa(self):
+        from serve import telemetry
+        per = [1.0] * 72                                            # a 72-thread host
+        fake = SimpleNamespace(cpu_count=lambda logical=True: 36,
+                               cpu_percent=lambda interval=None, percpu=False: per if percpu else sum(per) / len(per),
+                               virtual_memory=lambda: SimpleNamespace(total=256 * 2**30, available=200 * 2**30),
+                               disk_io_counters=lambda: None)
+        with tempfile.TemporaryDirectory() as d:
+            core = Path(d) / "devices/system/cpu/cpu18"             # pair-a's cpuset starts at core 18: node 1
+            core.mkdir(parents=True)
+            (core / "node1").mkdir()
+            with mock.patch.dict(sys.modules, {"psutil": fake}), \
+                 mock.patch.object(telemetry, "cpu_affinity", lambda: [18, 19, 54]), \
+                 mock.patch.object(telemetry, "gpu_reader", lambda i, amd=False: SimpleNamespace(**self.NO_GPU)), \
+                 mock.patch.object(telemetry, "SYSFS", d):
+                t = telemetry.Telemetry(gpu_index=0)
+                try:
+                    self.assertEqual(t.static["cpuset"], [18, 19, 54])
+                    self.assertEqual(t.static["numa_node"], 1)
+                    s = t.sample()
+                    self.assertEqual(s["cpu"], 1.0)                 # the host-wide average is unchanged
+                    self.assertEqual(s["cpu_cores"], [{"core": c, "util": 1.0} for c in (18, 19, 54)])
+                finally:
+                    t.close()
+        with tempfile.TemporaryDirectory() as empty:                # no sysfs (Windows, a hidden /sys/devices): None
+            with mock.patch.object(telemetry, "SYSFS", empty):
+                self.assertIsNone(telemetry.numa_node(18))
+
+    def test_unpinned_process_has_no_cpuset(self):
+        from serve import telemetry
+        with mock.patch.object(telemetry, "cpu_affinity", lambda: None), \
+             mock.patch.object(telemetry, "gpu_reader", lambda i, amd=False: SimpleNamespace(**self.NO_GPU)):
+            t = telemetry.Telemetry(gpu_index=0)
+            try:
+                self.assertIsNone(t.static["cpuset"])
+                self.assertIsNone(t.static["numa_node"])
+                self.assertNotIn("cpu_cores", t.sample())
             finally:
                 t.close()
 

@@ -33,6 +33,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/split_handoff.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -8977,12 +8978,18 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
+            // the PLE table's residency: the mode it actually ended in (the direct probe can switch a slow drive to
+            // mmap) and the MiB it maps into RAM (`ram` = mmap + mlock; 0 when it reads unbuffered or there is none)
+            const char* ple_mode = !ple_table.is_open() ? "none"
+                                   : ple_table.mode() == strata::kernels::PleIo::Direct ? "direct"
+                                   : ple_table.locked() ? "ram" : "mmap";
+            const long long ple_mib = (long long) (ple_table.mapped_bytes() >> 20);
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
-                        "tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
+                        "tail_role_token=%lld vram_elastic=%d ple_io=%s ple_mib=%lld%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -8995,6 +9002,7 @@ int main(int argc, char** argv) {
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
+                        ple_mode, ple_mib,
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
@@ -9449,7 +9457,8 @@ int main(int argc, char** argv) {
                                          "(BDONE nonfinite) and the next request reads its prompt from token 0\n", b,
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                    std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    std::printf("BDONE %d %lld nonfinite %.1f %lld\n", b, (long long) sl.produced, ms,
+                                (long long) strata::core::split_handoff_bytes());
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
@@ -9466,7 +9475,8 @@ int main(int argc, char** argv) {
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f %lld\n", b, (long long) sl.produced, fin, ms,
+                                    (long long) strata::core::split_handoff_bytes());
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
@@ -9607,7 +9617,8 @@ int main(int argc, char** argv) {
                                              "ends (BDONE nonfinite) and the next request reads its prompt from token 0\n",
                                      gi * GS + t, (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        std::printf("BDONE %d %lld nonfinite %.1f %lld\n", gi * GS + t, (long long) sl.produced, ms,
+                                    (long long) strata::core::split_handoff_bytes());
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -9624,7 +9635,8 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f %lld\n", gi * GS + t, (long long) sl.produced, fin, ms,
+                                    (long long) strata::core::split_handoff_bytes());
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -12287,6 +12299,9 @@ int main(int argc, char** argv) {
             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
             //      [offloaded]   (#588: the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
+            //      [split hand-off bytes]   (layer split: the engine's CUMULATIVE GPU<->GPU hand-off counter,
+            //                    include/strata/core/split_handoff.hpp; the server takes the difference since its
+            //                    last DONE/BDONE - a restart starts the counter over, the server then takes it whole)
             //      [lookup-chain accepted] [lookup-chain offered] [suffix accepted] [suffix offered] [windows]
             //      (only with --lookup-chain)
             char chain_txt[128] = "";
@@ -12294,13 +12309,13 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld %lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                        (long long) req_offload, chain_txt);
+                        (long long) req_offload, (long long) strata::core::split_handoff_bytes(), chain_txt);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
