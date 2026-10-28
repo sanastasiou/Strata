@@ -99,8 +99,9 @@ class _Nvml:
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
         out["power_limit"] = lim / 1000.0 if lim is not None else None
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
-        out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
+        out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")     # the card's capability, never downclocked
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
+        out["pcie_width_max"] = self._uint("nvmlDeviceGetMaxPcieLinkWidth")
         rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
@@ -230,6 +231,8 @@ class _Amd:
         gen = min(gens) if (whole and gens) else own_gen
         width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
         return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
+                "pcie_width_max": width,   # the amdgpu files give the capability (max_link_width per hop), not a
+                                           # separately-downclocked width: the max is the same reading
                 "pcie_path": "%d/%d" % (read, len(hops))}
 
 
@@ -647,7 +650,10 @@ class Telemetry:
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
                               "pcie_rx_mb": r.get("pcie_rx_mb"), "pcie_tx_mb": r.get("pcie_tx_mb"),
-                              "pcie_gen": r.get("pcie_gen"), "pcie_width": r.get("pcie_width")}
+                              "pcie_gen": r.get("pcie_gen"), "pcie_width": r.get("pcie_width"),
+                              # the negotiated link and the card's capability: an idle card downclocks its gen/width,
+                              # and the dashboard must not read that as a broken slot (max from NVML's own Max* calls)
+                              "pcie_gen_max": r.get("pcie_gen_max"), "pcie_width_max": r.get("pcie_width_max")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:

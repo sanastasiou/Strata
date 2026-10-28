@@ -5918,6 +5918,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
+    // G4 (the serve INFO line's arena_shared flag): the shared-file backing has NO fallback - reserve() refuses the
+    // whole arena (null base) when the MAP_SHARED file cannot be opened, sized, header-checked or mapped.  A valid
+    // arena reached past the mapped-experts.bin paths with a shared file asked for IS that file's mapping: the flag
+    // says what was attached, not what was asked.
+    arena_shared_ = !shared_arena_file.empty();
     // #285: unbuffered when the drive is read anyway and the file cache could not keep the experts for the next
     // start either (a 64 GB PC); otherwise the buffered readers, which a warm restart serves from the cache
     std::vector<std::string> files;
@@ -6064,6 +6069,7 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+    arena_shared_ = false;
 }
 
 void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {

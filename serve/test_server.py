@@ -4908,6 +4908,59 @@ class PleInfoLine(unittest.TestCase):
                     eng.unload()
 
 
+FAKE_STRATA_ARENA = '''import pathlib, sys, time
+gate = pathlib.Path(sys.argv[sys.argv.index("--gate") + 1])
+flag = sys.argv[sys.argv.index("--arena-shared") + 1]
+print("INFO engine=0.0.0 ple_io=ram ple_mib=29491 arena_shared=%s" % flag, flush=True)
+while not gate.exists():                     # the test says when the engine is "ready"
+    time.sleep(0.01)
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if line.startswith("QUIT"):
+        break
+'''
+
+
+class ArenaSharedInfoLine(unittest.TestCase):
+    """Fork telemetry G4: the engine's INFO line carries `arena_shared=1` when it attached a shared expert arena
+    and `arena_shared=0` otherwise (the flag src/program/generate.cpp prints next to ple_io/ple_mib, taken from
+    the arena it attached, not the option it was given). The serve loop's generic INFO parser turns both into
+    ints in engine.info - and the dashboard reads engine.arena_shared as a 0/1 flag."""
+
+    def info_for(self, flag):
+        from unittest import mock
+        import serve.server as server
+        with tempfile.TemporaryDirectory() as d:
+            script, gate = Path(d) / "fake_strata.py", Path(d) / "ready"
+            script.write_text(FAKE_STRATA_ARENA, encoding="utf-8")
+            real = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+                gate.touch()
+                eng = StrataEngine("strata", ["--gate", str(gate), "--arena-shared", flag])
+                try:
+                    self.assertEqual(eng.info.get("ple_io"), "ram")   # the G3 fields sit beside it, unchanged
+                    return dict(eng.info)
+                finally:
+                    gate.touch()
+                    eng.unload()
+
+    def test_both_arena_shared_values_reach_engine_info(self):
+        self.assertEqual(self.info_for("1").get("arena_shared"), 1)
+        self.assertEqual(self.info_for("0").get("arena_shared"), 0)
+
+    def test_generate_cpp_prints_the_attached_arena_flag(self):
+        """The serve INFO line itself (src/program/generate.cpp, the printf this fake line mirrors): it carries
+        `arena_shared=%d` beside ple_io/ple_mib, and its value is the arena the engine ATTACHED
+        (arena_src.arena_shared(), tests/core/arena_expert_source_test.cpp) - never a constant."""
+        src = (ROOT / "src/program/generate.cpp").read_text(encoding="utf-8")
+        # the flag sits next to ple_io/ple_mib, and its value is the arena actually attached (never a constant:
+        # mutate this argument to a literal 0 and the assertIn below turns red, as the flag must be for the test)
+        self.assertIn(r"ple_io=%s ple_mib=%lld arena_shared=%d%s engine=", src)
+        self.assertIn("srcp == &arena_src ? arena_src.arena_shared() : 0,", src)
+        self.assertNotIn(r'arena_shared=0"%s engine=', src)     # not hardcoded into the format
+
+
 class RestartWindow(unittest.TestCase):
     """#344: while the engine restarts it is not alive (a request waits for the restart instead of reading
     max_context 0), and a request that still meets max_context 0 gets a 503 "starting", not a 400 about its prompt."""
@@ -5151,7 +5204,7 @@ class AmdTelemetry(unittest.TestCase):
             a.dev = hops[-1]
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops):
                 self.assertEqual(a.link(), {"pcie_gen": 3, "pcie_gen_max": 3, "pcie_own_gen": 4, "pcie_width": 8,
-                                            "pcie_path": "3/3"})
+                                            "pcie_width_max": 8, "pcie_path": "3/3"})
             with mock.patch.object(telemetry._Amd, "_hops", lambda self: hops[:2] + [str(Path(d) / "hidden")]):
                 got = a.link()             # an unreadable hop: fall back to the card's own negotiated link
                 self.assertEqual((got["pcie_gen"], got["pcie_width"], got["pcie_path"]), (4, 16, "2/3"))
@@ -5174,7 +5227,7 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertEqual(g.read(), {"util": 37, "mem_used": 2 << 30, "mem_total": 32 << 30, "temp": 51.0,
                                             "power": 85.0, "power_limit": 300.0, "pcie_gen": None,
                                             "pcie_gen_max": None, "pcie_own_gen": None, "pcie_width": None,
-                                            "pcie_path": "0/0"})    # #1733: no PCIe files in this fake tree
+                                            "pcie_width_max": None, "pcie_path": "0/0"})    # #1733: no PCIe files here
                 r = telemetry.gpu_reader(1, amd=True).read()
                 self.assertEqual((r["util"], r["temp"], r["power"]), (99, 64.0, 120.0))     # power1_input
                 self.assertEqual(telemetry.free_vram_mib(0, amd=True), 30 << 10)
@@ -5305,7 +5358,7 @@ class TelemetryNoDisks(unittest.TestCase):
 
 
 class SplitCardTelemetry(unittest.TestCase):
-    """Fork telemetry G1/G5/G6: each gpus[] entry carries its own PCIe rate and link (the summed gpu_* readings hide
+    """Fork telemetry G1/G4/G5/G6: each gpus[] entry carries its own PCIe rate and link, current and max (the summed gpu_* readings hide
     which card carries the traffic, and only the first card's gen/width survived the sum: a split's x8 card read as
     x16); the sampler reports the cores the process is pinned to (a container's cpuset) with their live load, and
     the NUMA node of the first one."""
@@ -5320,6 +5373,7 @@ class SplitCardTelemetry(unittest.TestCase):
             return {"util": 10 * self.i, "mem_used": 1 << 30, "mem_total": 2 << 30, "temp": 50 + self.i,
                     "power": 100.0, "power_limit": 300.0, "pcie_gen": 3, "pcie_gen_max": 3,
                     "pcie_width": 16 if self.i == 0 else 8,        # the x8 card of a pair (docs: GPU0/3 run x8)
+                    "pcie_width_max": 16,                          # both cards are x16 parts: the x8 one is slotted x8
                     "pcie_rx_mb": 400.0 + self.i, "pcie_tx_mb": 70.0 + self.i}
 
     def test_per_card_pcie_in_gpus(self):
@@ -5328,8 +5382,10 @@ class SplitCardTelemetry(unittest.TestCase):
             t = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1])
             try:
                 s = t.sample()
-                self.assertEqual([(g["index"], g["pcie_rx_mb"], g["pcie_tx_mb"], g["pcie_gen"], g["pcie_width"])
-                                  for g in s["gpus"]], [(0, 400.0, 70.0, 3, 16), (1, 401.0, 71.0, 3, 8)])
+                self.assertEqual([(g["index"], g["pcie_rx_mb"], g["pcie_tx_mb"], g["pcie_gen"], g["pcie_width"],
+                                   g["pcie_gen_max"], g["pcie_width_max"])
+                                  for g in s["gpus"]],
+                                 [(0, 400.0, 70.0, 3, 16, 3, 16), (1, 401.0, 71.0, 3, 8, 3, 16)])
                 self.assertEqual(s["gpu_pcie_rx_mb"], 801.0)        # the summed readings stay as they were
             finally:
                 t.close()
