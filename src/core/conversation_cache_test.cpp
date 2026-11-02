@@ -784,5 +784,21 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // #4420 x our --batch supersede rule: supersedes_richer() must name EVERY entry drop_superseded() would drop. A slot whose
+        // chain lacks the copy's deepest checkpoint but whose live tokens continue past it also drops the main session's copy -
+        // root checkpoint included - so that park must be refused too
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation main_copy = image({1, 2, 3, 4, 10, 11, 12});
+        main_copy.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 10, 11})};
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(std::move(main_copy)), "park the main session's copy with its root and turn checkpoints");
+        const std::vector<int32_t> slot_ids{1, 2, 3, 4, 10, 11, 12, 20, 21};
+        const std::vector<ConversationCheckpoint> stride_chain{cp({1, 2, 3, 4, 10})};   // a stride point, not the turn boundary
+        check(cache.supersedes_richer(slot_ids, {}, stride_chain, true),
+              "a slot continuing past the copy's deepest point would drop the root: named");
+        check(cache.size() == 1 && cache.superseded() == 0, "the predicate still changes nothing");
+        check(cache.drop_superseded(slot_ids, {}, stride_chain, true) == 1, "and drop_superseded() indeed drops it");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

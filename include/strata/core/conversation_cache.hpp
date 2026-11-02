@@ -432,6 +432,36 @@ public:
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
 
+    // The outgoing state (live tokens + chain) holds checkpoint c: as its live point or as one of its chain's.
+    static bool holds_checkpoint(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
+                                 const std::vector<ConversationImageKey>& images,
+                                 const std::vector<ConversationCheckpoint>& checkpoints) {
+        if (c.ids == ids && c.imgs == images) return true;
+        for (const auto& k : checkpoints)
+            if (k.ids == c.ids && k.imgs == c.imgs) return true;
+        return false;
+    }
+    // The one rule (#342, extended for --batch) by which an outgoing conversation supersedes parked entry i. drop_superseded()
+    // drops exactly these; supersedes_richer() (#4420) asks the same question, so a slot park can never drop what it did not name.
+    // Superseded: same steering mode, not the guarded entry, and its deepest checkpoint is either held by the outgoing chain, or
+    // the outgoing live tokens simply continue past it - under --batch the chain is rebuilt from a slot and need not hold the old
+    // turn's boundary, yet the copy still adds only the stale tail - provided that point lies beyond the outgoing chain's root
+    // (its shortest point, the system prompt's end): a copy no deeper than that shares only the root, which proves nothing.
+    bool supersedes_entry(size_t i, const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                          const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        const auto& e = entries_[i];
+        if (e.cvec != cvec || (guarded_ != 0 && serials_[i] == guarded_)) return false;
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (!deepest || deepest->ids.empty()) return false;
+        if (holds_checkpoint(*deepest, ids, images, checkpoints)) return true;
+        size_t root = 0;
+        for (const auto& k : checkpoints)
+            if (root == 0 || k.ids.size() < root) root = k.ids.size();
+        return ids.size() > e.live.ids.size() && deepest->ids.size() > root && conversation_prefix(*deepest, ids, images) > 0;
+    }
+
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
@@ -441,30 +471,10 @@ public:
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
-        // the outgoing chain's root (its shortest point, the system prompt's end): a copy whose deepest point is no
-        // deeper shares only that root with the outgoing conversation, so a prefix match there proves nothing
-        size_t root = 0;
-        for (const auto& k : checkpoints)
-            if (root == 0 || k.ids.size() < root) root = k.ids.size();
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            // or the outgoing live tokens simply continue past it: under --batch the chain is rebuilt from a slot
-            // and need not hold the old turn's boundary, yet the copy still adds only the stale tail
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() &&
-                (held(*deepest) || (ids.size() > e.live.ids.size() && deepest->ids.size() > root &&
-                                    conversation_prefix(*deepest, ids, images) > 0)) &&
-                !(guarded_ != 0 && serials_[i] == guarded_)) {
-                bytes_ -= e.bytes();
+            if (supersedes_entry(i, ids, images, checkpoints, cvec)) {
+                bytes_ -= entries_[i].bytes();
                 erase(i);
                 ++dropped;
                 continue;
@@ -482,22 +492,10 @@ public:
     // given chain does not hold.  Nothing is changed.
     bool supersedes_richer(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
         for (size_t i = 0; i < entries_.size(); ++i) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec != cvec || !deepest || deepest->ids.empty() || !held(*deepest) ||
-                (guarded_ != 0 && serials_[i] == guarded_))
-                continue;
-            for (const auto& c : e.checkpoints)
-                if (!held(c)) return true;
+            if (!supersedes_entry(i, ids, images, checkpoints, cvec)) continue;   // the SAME rule drop_superseded() applies
+            for (const auto& c : entries_[i].checkpoints)
+                if (!holds_checkpoint(c, ids, images, checkpoints)) return true;
         }
         return false;
     }
